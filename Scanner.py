@@ -1,4 +1,3 @@
-Scanner
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -137,16 +136,13 @@ strategy_list = {
     }
 }
 
-# ---------------------- 載入資料函數 ----------------------
-@st.cache_data(ttl=3600)
+# ---------------------- 載入資料函數，增加快取上限控制 ----------------------
+@st.cache_data(ttl=3600, max_entries=500, show_spinner="讀取台股資料中...")
 def load_tw_stock_data():
-    """
-    載入台股資料、計算各項指標，回傳合併DataFrame
-    """
     import warnings
     warnings.filterwarnings("ignore")
 
-    # 1. 每日股價資料，修改：由180天 → 120天
+    # 1. 每日股價資料 120天
     df_daily = api.taiwan_stock_daily(
         start_date=(pd.Timestamp.now()-pd.Timedelta(days=120)).strftime("%Y-%m-%d")
     )
@@ -167,50 +163,45 @@ def load_tw_stock_data():
     df_daily["change_40d"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.pct_change(40))
     df_daily["change_120d"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.pct_change(120))
 
-    # 週轉率
     df_daily["turnover_rate"] = df_daily["turnover"]
-
-    # 只取最新一筆資料(最新交易日)
     df_latest = df_daily.loc[df_daily.groupby("stock_id")["date"].idxmax()].copy()
 
     # 2. 股本資料
     df_info = api.taiwan_stock_info()
-    df_info["capital"] = df_info["capital"] / 100_000_000 # 轉成億元
+    df_info["capital"] = df_info["capital"] / 100_000_000
     df_merge = pd.merge(df_latest, df_info[["stock_id","stock_name","capital"]], on="stock_id", how="left")
 
-    # 3. 三大法人買賣超，修改：150天 →120天
+    # 3. 三大法人 120天
     df_institutional = api.taiwan_stock_institutional_investors(
         start_date=(pd.Timestamp.now()-pd.Timedelta(days=120)).strftime("%Y-%m-%d")
     )
     df_institutional["net_buy"] = df_institutional["foreign_buy"] + df_institutional["investment_buy"] + df_institutional["dealer_buy"] - df_institutional["foreign_sell"] - df_institutional["investment_sell"] - df_institutional["dealer_sell"]
     df_institutional_10d = df_institutional.groupby("stock_id")["net_buy"].sum().reset_index()
     df_institutional_10d.columns = ["stock_id","institutional_10d_sell"]
-    df_institutional_10d["institutional_10d_sell"] = -df_institutional_10d["institutional_10d_sell"] # 賣超轉正數
+    df_institutional_10d["institutional_10d_sell"] = -df_institutional_10d["institutional_10d_sell"]
     df_merge = pd.merge(df_merge, df_institutional_10d, on="stock_id", how="left")
 
-    # 4. 融券資料，修改：150天 →120天
+    # 4. 融券資料 120天
     df_short = api.taiwan_stock_short_sale(
         start_date=(pd.Timestamp.now()-pd.Timedelta(days=120)).strftime("%Y-%m-%d")
     )
     df_short = df_short.sort_values(["stock_id","date"])
-    df_short["short_10d_high"] = df_short.groupby("stock_id")["short_sale_balance"].transform(lambda x: x == x.rolling(window=10).max())
-    df_short["short_inc_rate"] = df_short.groupby("stock_id")["short_sale_balance"].transform(lambda x: x.pct_change() *100)
-    df_short_latest = df_short.loc[df_short.groupby("stock_id")["date"].idxmax()][["stock_id","short_10d_high","short_inc_rate"]]
-    df_short_latest.columns=["stock_id","short_sell_10d_high","short_sell_increase_rate"]
+    df_short["short_sell_10d_high"] = df_short.groupby("stock_id")["short_sale_balance"].transform(lambda x: x == x.rolling(window=10).max())
+    df_short["short_sell_increase_rate"] = df_short.groupby("stock_id")["short_sale_balance"].transform(lambda x: x.pct_change() *100)
+    df_short_latest = df_short.loc[df_short.groupby("stock_id")["date"].idxmax()][["stock_id","short_sell_10d_high","short_sell_increase_rate"]]
     df_merge = pd.merge(df_merge, df_short_latest, on="stock_id", how="left")
 
-    # 5. 營收資料（保留730天，營收創高需要長歷史）
+    # 5. 營收
     df_rev = api.taiwan_stock_month_revenue(
         start_date=(pd.Timestamp.now()-pd.Timedelta(days=730)).strftime("%Y-%m-%d")
     )
     df_rev = df_rev.sort_values(["stock_id","date"])
-    df_rev["rev_new_high"] = df_rev.groupby("stock_id")["revenue"].transform(lambda x: x == x.expanding().max())
-    df_rev["rev_growth"] = df_rev["revenue_year_on_year"]
-    df_rev_latest = df_rev.loc[df_rev.groupby("stock_id")["date"].idxmax()][["stock_id","rev_new_high","rev_growth"]]
-    df_rev_latest.columns = ["stock_id","rev_monthly_new_high","rev_growth_rate"]
+    df_rev["rev_monthly_new_high"] = df_rev.groupby("stock_id")["revenue"].transform(lambda x: x == x.expanding().max())
+    df_rev["rev_growth_rate"] = df_rev["revenue_year_on_year"]
+    df_rev_latest = df_rev.loc[df_rev.groupby("stock_id")["date"].idxmax()][["stock_id","rev_monthly_new_high","rev_growth_rate"]]
     df_merge = pd.merge(df_merge, df_rev_latest, on="stock_id", how="left")
 
-    # 6. EPS 近三季（保留730天）
+    # 6. EPS
     df_fin = api.taiwan_stock_financial_statement(
         start_date=(pd.Timestamp.now()-pd.Timedelta(days=730)).strftime("%Y-%m-%d")
     )
@@ -220,39 +211,9 @@ def load_tw_stock_data():
     df_eps_3q.columns=["stock_id","eps_3q"]
     df_merge = pd.merge(df_merge, df_eps_3q, on="stock_id", how="left")
 
-    # 清理空值
     df_merge = df_merge.fillna(0)
     return df_merge
 
 # ---------------------- UI介面 ----------------------
-st.title("🦑 烏賊戰術｜台股8套選股策略掃描器")
-st.markdown("""
-> 資料來源：FinMind開放資料庫，非盤中即時報價，每日更新一次。
-> ⚠️ 僅供學習研究，**不構成任何投資建議，投資有風險**
-""")
-
-selected_strategy_name = st.selectbox("請選擇要執行的選股策略", list(strategy_list.keys()))
-selected_strategy = strategy_list[selected_strategy_name]
-
-st.subheader(" 策略規則")
-st.markdown(selected_strategy["desc"])
-
-if st.button(" 開始掃描選股"):
-    with st.spinner("正在下載台股資料、計算指標，請稍候..."):
-        df_all = load_tw_stock_data()
-        mask = selected_strategy["func"](df_all)
-        result = df_all[mask][["stock_id","stock_name","close","volume","ma5_volume","capital"]].copy()
-        result = result.sort_values("close")
-    st.success(f"✅ 掃描完成！一共找到 {len(result)} 檔符合條件個股")
-    st.dataframe(result, use_container_width=True)
-
-    # ========== 匯出CSV功能 ==========
-    csv_data = result.to_csv(index=False, encoding="utf-8-sig")
-    # utf-8-sig 避免Excel開啟中文亂碼
-    st.download_button(
-        label=" 下載篩選結果 CSV",
-        data=csv_data,
-        file_name=f"{selected_strategy_name}_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv"
-    )
+st.title("🦑 烏賊戰術｜台股8套選
 
