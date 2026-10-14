@@ -1,0 +1,258 @@
+Scanner
+import streamlit as st
+import pandas as pd
+import numpy as np
+from FinMind.data import DataLoader
+
+# ---------------------- 初始化 ----------------------
+st.set_page_config(page_title="烏賊戰術｜台股8策略選股器", layout="wide")
+api = DataLoader()
+
+# ---------------------- 策略定義（8套完整規則） ----------------------
+strategy_list = {
+    "策略一｜短期大波動+高週轉小型股": {
+        "desc": """
+✅ 條件：
+1. 近20個交易日股價漲跌幅絕對值 >10%
+2. 近1日週轉率 >10%
+3. 股本 <20億元
+❌ 過濾：股價<5元、五日均量<=500張剔除
+""",
+        "func": lambda df: (
+            (abs(df["change_20d"]) > 0.10) &
+            (df["turnover_rate"] > 10) &
+            (df["capital"] < 20) &
+            ~((df["close"] <5) | (df["ma5_volume"] <=500))
+        )
+    },
+    "策略二｜30日橫盤+單日量能放大": {
+        "desc": """
+✅ 條件：
+1. 近一日成交量 > 五日均量*1.2
+2. 近30個交易日股價漲跌幅絕對值 <1%
+❌ 過濾：股價<5元、五日均量<=500張剔除
+ 人工參考：搭配外資投信動態判斷
+""",
+        "func": lambda df: (
+            (df["volume"] > df["ma5_volume"] * 1.2) &
+            (abs(df["change_30d"]) < 0.01) &
+            ~((df["close"] <5) | (df["ma5_volume"] <=500))
+        )
+    },
+    "策略三｜10日波動+三倍爆量中小型股": {
+        "desc": """
+✅ 條件：
+1. 近10個交易日股價漲跌幅絕對值 >1%
+2. 近一日成交量 >五日均量*3.0
+3. 近一日成交量 >100張
+4. 股本 <30億元
+❌ 不過濾：保留股價5元以下、五日均量<=500張
+""",
+        "func": lambda df: (
+            (abs(df["change_10d"]) >0.01) &
+            (df["volume"] > df["ma5_volume"] *3.0) &
+            (df["volume"] > 100) &
+            (df["capital"] <30)
+        )
+    },
+    "策略四｜假突破轉弱，法人賣超": {
+        "desc": """
+✅ 條件：
+1. 近一交易日股價 <5MA
+2. 近40個交易日股價漲跌幅絕對值 >30%
+3. 近10天三大法人累計賣超>10000張
+❌ 過濾：股價<5元、五日均量<=500張剔除
+""",
+        "func": lambda df: (
+            (df["close"] < df["ma5"]) &
+            (abs(df["change_40d"]) >0.30) &
+            (df["institutional_10d_sell"] >10000) &
+            ~((df["close"] <5) | (df["ma5_volume"] <=500))
+        )
+    },
+    "策略五｜營收創高基本面成長股": {
+        "desc": """
+✅ 條件：
+1. 近一交易日股價 <50元
+2. 近三季EPS合計 >0.5元
+3. 近一個月營收創歷史新高
+4. 近一個月營收成長率 >20%
+❌ 不過濾：保留股價5元以下、五日均量<=500張
+""",
+        "func": lambda df: (
+            (df["close"] <50) &
+            (df["eps_3q"] >0.5) &
+            (df["rev_monthly_new_high"] == True) &
+            (df["rev_growth_rate"] > 20)
+        )
+    },
+    "策略六｜站上10MA+融券創10日新高": {
+        "desc": """
+✅ 條件：
+1. 近一交易日股價 >10MA
+2. 近5個交易日股價漲跌幅絕對值 >10%
+3. 股本 <30億元
+4. 融券餘額創10日新高
+❌ 不過濾：保留股價5元以下、五日均量<=500張
+""",
+        "func": lambda df: (
+            (df["close"] > df["ma10"]) &
+            (abs(df["change_5d"]) > 0.10) &
+            (df["capital"] <30) &
+            (df["short_sell_10d_high"] == True)
+        )
+    },
+    "策略七｜長期超跌+兩倍爆量反彈": {
+        "desc": """
+✅ 條件：
+1. 近120個交易日股價漲跌幅 < -20%
+2. 近一日成交量 >五日均量*2.0
+3. 近一交易日股價 >5MA
+❌ 不過濾：保留股價5元以下、五日均量<=500張
+""",
+        "func": lambda df: (
+            (df["change_120d"] < -0.20) &
+            (df["volume"] > df["ma5_volume"] * 2.0) &
+            (df["close"] > df["ma5"])
+        )
+    },
+    "策略八｜站上20MA窄盤+融券單日大增": {
+        "desc": """
+✅ 條件：
+1. 近一交易日股價 <30元
+2. 近一交易日股價 >20MA
+3. 近3個交易日股價漲跌幅絕對值 <3%
+4. 股本 <50億元
+5. 近1日融券餘額增加 >8%
+❌ 過濾：股價<5元、五日均量<=500張剔除
+""",
+        "func": lambda df: (
+            (df["close"] <30) &
+            (df["close"] > df["ma20"]) &
+            (abs(df["change_3d"]) <0.03) &
+            (df["capital"] <50) &
+            (df["short_sell_increase_rate"] > 8) &
+            ~((df["close"] <5) | (df["ma5_volume"] <=500))
+        )
+    }
+}
+
+# ---------------------- 載入資料函數 ----------------------
+@st.cache_data(ttl=3600)
+def load_tw_stock_data():
+    """
+    載入台股資料、計算各項指標，回傳合併DataFrame
+    """
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    # 1. 每日股價資料，修改：由180天 → 120天
+    df_daily = api.taiwan_stock_daily(
+        start_date=(pd.Timestamp.now()-pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+    )
+    df_daily = df_daily.sort_values(["stock_id","date"])
+
+    # 移動平均
+    df_daily["ma5"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.rolling(5).mean())
+    df_daily["ma10"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.rolling(10).mean())
+    df_daily["ma20"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.rolling(20).mean())
+    df_daily["ma5_volume"] = df_daily.groupby("stock_id")["volume"].transform(lambda x: x.rolling(5).mean())
+
+    # 各區間漲跌幅
+    df_daily["change_3d"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.pct_change(3))
+    df_daily["change_5d"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.pct_change(5))
+    df_daily["change_10d"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.pct_change(10))
+    df_daily["change_20d"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.pct_change(20))
+    df_daily["change_30d"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.pct_change(30))
+    df_daily["change_40d"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.pct_change(40))
+    df_daily["change_120d"] = df_daily.groupby("stock_id")["close"].transform(lambda x: x.pct_change(120))
+
+    # 週轉率
+    df_daily["turnover_rate"] = df_daily["turnover"]
+
+    # 只取最新一筆資料(最新交易日)
+    df_latest = df_daily.loc[df_daily.groupby("stock_id")["date"].idxmax()].copy()
+
+    # 2. 股本資料
+    df_info = api.taiwan_stock_info()
+    df_info["capital"] = df_info["capital"] / 100_000_000 # 轉成億元
+    df_merge = pd.merge(df_latest, df_info[["stock_id","stock_name","capital"]], on="stock_id", how="left")
+
+    # 3. 三大法人買賣超，修改：150天 →120天
+    df_institutional = api.taiwan_stock_institutional_investors(
+        start_date=(pd.Timestamp.now()-pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+    )
+    df_institutional["net_buy"] = df_institutional["foreign_buy"] + df_institutional["investment_buy"] + df_institutional["dealer_buy"] - df_institutional["foreign_sell"] - df_institutional["investment_sell"] - df_institutional["dealer_sell"]
+    df_institutional_10d = df_institutional.groupby("stock_id")["net_buy"].sum().reset_index()
+    df_institutional_10d.columns = ["stock_id","institutional_10d_sell"]
+    df_institutional_10d["institutional_10d_sell"] = -df_institutional_10d["institutional_10d_sell"] # 賣超轉正數
+    df_merge = pd.merge(df_merge, df_institutional_10d, on="stock_id", how="left")
+
+    # 4. 融券資料，修改：150天 →120天
+    df_short = api.taiwan_stock_short_sale(
+        start_date=(pd.Timestamp.now()-pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+    )
+    df_short = df_short.sort_values(["stock_id","date"])
+    df_short["short_10d_high"] = df_short.groupby("stock_id")["short_sale_balance"].transform(lambda x: x == x.rolling(window=10).max())
+    df_short["short_inc_rate"] = df_short.groupby("stock_id")["short_sale_balance"].transform(lambda x: x.pct_change() *100)
+    df_short_latest = df_short.loc[df_short.groupby("stock_id")["date"].idxmax()][["stock_id","short_10d_high","short_inc_rate"]]
+    df_short_latest.columns=["stock_id","short_sell_10d_high","short_sell_increase_rate"]
+    df_merge = pd.merge(df_merge, df_short_latest, on="stock_id", how="left")
+
+    # 5. 營收資料（保留730天，營收創高需要長歷史）
+    df_rev = api.taiwan_stock_month_revenue(
+        start_date=(pd.Timestamp.now()-pd.Timedelta(days=730)).strftime("%Y-%m-%d")
+    )
+    df_rev = df_rev.sort_values(["stock_id","date"])
+    df_rev["rev_new_high"] = df_rev.groupby("stock_id")["revenue"].transform(lambda x: x == x.expanding().max())
+    df_rev["rev_growth"] = df_rev["revenue_year_on_year"]
+    df_rev_latest = df_rev.loc[df_rev.groupby("stock_id")["date"].idxmax()][["stock_id","rev_new_high","rev_growth"]]
+    df_rev_latest.columns = ["stock_id","rev_monthly_new_high","rev_growth_rate"]
+    df_merge = pd.merge(df_merge, df_rev_latest, on="stock_id", how="left")
+
+    # 6. EPS 近三季（保留730天）
+    df_fin = api.taiwan_stock_financial_statement(
+        start_date=(pd.Timestamp.now()-pd.Timedelta(days=730)).strftime("%Y-%m-%d")
+    )
+    df_eps = df_fin[df_fin["variable"]=="EPS"].copy()
+    df_eps = df_eps.sort_values(["stock_id","date"])
+    df_eps_3q = df_eps.groupby("stock_id")["value"].tail(3).groupby("stock_id").sum().reset_index()
+    df_eps_3q.columns=["stock_id","eps_3q"]
+    df_merge = pd.merge(df_merge, df_eps_3q, on="stock_id", how="left")
+
+    # 清理空值
+    df_merge = df_merge.fillna(0)
+    return df_merge
+
+# ---------------------- UI介面 ----------------------
+st.title("🦑 烏賊戰術｜台股8套選股策略掃描器")
+st.markdown("""
+> 資料來源：FinMind開放資料庫，非盤中即時報價，每日更新一次。
+> ⚠️ 僅供學習研究，**不構成任何投資建議，投資有風險**
+""")
+
+selected_strategy_name = st.selectbox("請選擇要執行的選股策略", list(strategy_list.keys()))
+selected_strategy = strategy_list[selected_strategy_name]
+
+st.subheader(" 策略規則")
+st.markdown(selected_strategy["desc"])
+
+if st.button(" 開始掃描選股"):
+    with st.spinner("正在下載台股資料、計算指標，請稍候..."):
+        df_all = load_tw_stock_data()
+        mask = selected_strategy["func"](df_all)
+        result = df_all[mask][["stock_id","stock_name","close","volume","ma5_volume","capital"]].copy()
+        result = result.sort_values("close")
+    st.success(f"✅ 掃描完成！一共找到 {len(result)} 檔符合條件個股")
+    st.dataframe(result, use_container_width=True)
+
+    # ========== 匯出CSV功能 ==========
+    csv_data = result.to_csv(index=False, encoding="utf-8-sig")
+    # utf-8-sig 避免Excel開啟中文亂碼
+    st.download_button(
+        label=" 下載篩選結果 CSV",
+        data=csv_data,
+        file_name=f"{selected_strategy_name}_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv"
+    )
+
